@@ -20,6 +20,7 @@ const statusText = $("#statusText");
 const alignmentGuide = $("#alignmentGuide");
 const flipButton = $("#flipButton");
 const debugButton = $("#debugButton");
+const calibrateButton = $("#calibrateButton");
 const fitControls = $("#fitControls");
 const fitInputs = {
   x: $("#fitX"),
@@ -47,6 +48,8 @@ const state = {
   hasFace: false,
   smoothed: null,
   lastFaceSeenAt: 0,
+  lockedEar: null,
+  calibrating: false,
   fitAdjustments: loadFitAdjustments(),
 };
 
@@ -337,7 +340,34 @@ function weightedPoint(points, weights) {
   };
 }
 
-function resolveTracking(landmarks, mapPoint) {
+function extractHeadPose(matrixData, landmarkYaw, landmarkRoll) {
+  if (!matrixData?.data || matrixData.data.length !== 16) return null;
+  try {
+    // MediaPipe exposes the canonical-face transform as a row-major 4x4.
+    const matrix = new THREE.Matrix4().set(...matrixData.data);
+    const position = new THREE.Vector3();
+    const quaternion = new THREE.Quaternion();
+    const scale = new THREE.Vector3();
+    matrix.decompose(position, quaternion, scale);
+    const euler = new THREE.Euler().setFromQuaternion(quaternion, "XYZ");
+    let yaw = euler.y;
+    let roll = euler.z;
+    // Coordinate handedness varies between front/rear camera paths. Align the
+    // matrix sign to the landmark estimate when there is enough motion.
+    if (Math.abs(landmarkYaw) > 0.035 && Math.abs(yaw) > 0.035 && Math.sign(yaw) !== Math.sign(landmarkYaw)) yaw *= -1;
+    if (Math.abs(landmarkRoll) > 0.025 && Math.abs(roll) > 0.025 && Math.sign(roll) !== Math.sign(landmarkRoll)) roll *= -1;
+    if (![yaw, roll, euler.x].every(Number.isFinite)) return null;
+    return {
+      yaw: clamp(yaw, -1.15, 1.15),
+      pitch: clamp(euler.x, -0.7, 0.7),
+      roll: clamp(roll, -0.75, 0.75),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function resolveTracking(landmarks, mapPoint, transformationMatrix) {
   // A single face-outline landmark moves several pixels with expression and
   // yaw. Blend temple, cheek and jaw landmarks into a much steadier ear proxy.
   const leftUpper = mapPoint(landmarks[127]);
@@ -360,11 +390,17 @@ function resolveTracking(landmarks, mapPoint) {
   const leftSpan = Math.abs(nose.x - leftEdge.x);
   const rightSpan = Math.abs(rightEdge.x - nose.x);
   const rawYaw = (leftSpan - rightSpan) / Math.max(leftSpan + rightSpan, 0.001);
-  const yaw = clamp(rawYaw * 1.7, -0.9, 0.9);
-  const roll = Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x);
+  const landmarkYaw = clamp(rawYaw * 1.7, -0.9, 0.9);
+  const landmarkRoll = Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x);
+  const headPose = extractHeadPose(transformationMatrix, landmarkYaw, landmarkRoll);
+  const yaw = headPose ? clamp(landmarkYaw * 0.38 + headPose.yaw * 0.62, -0.95, 0.95) : landmarkYaw;
+  const roll = headPose ? landmarkRoll * 0.45 + headPose.roll * 0.55 : landmarkRoll;
+  const pitch = headPose?.pitch || 0;
 
   let ear = state.selectedEar;
   if (ear === "auto") {
+    if (state.lockedEar) ear = state.lockedEar;
+    else {
     // Hysteresis prevents rapid left/right switching when looking forward.
     const current = state.smoothed?.ear;
     if (current === "left" && yaw < 0.16) ear = "left";
@@ -372,6 +408,7 @@ function resolveTracking(landmarks, mapPoint) {
     else if (yaw > 0.1) ear = "right";
     else if (yaw < -0.1) ear = "left";
     else ear = current || "right";
+    }
   }
   const edge = ear === "left" ? leftEdge : rightEdge;
   const direction = ear === "left" ? -1 : 1;
@@ -383,7 +420,8 @@ function resolveTracking(landmarks, mapPoint) {
   // Face height changes substantially less than visible face width during yaw.
   const scale = faceHeight * profile.scale * fit.scale;
 
-  return { x, y, scale, roll, yaw, ear, edge, faceWidth, faceHeight, fitRotation: fit.rotation, profileRoll: profile.roll };
+  const visibility = state.selectedEar === "auto" ? clamp((Math.abs(yaw) - 0.025) / 0.11, 0, 1) : 1;
+  return { x, y, scale, roll, pitch, yaw, ear, edge, faceWidth, faceHeight, visibility, fitRotation: fit.rotation, profileRoll: profile.roll };
 }
 
 function smoothTracking(target) {
@@ -400,6 +438,8 @@ function smoothTracking(target) {
   state.smoothed.scale = lerp(state.smoothed.scale, boundedScale, 0.16);
   state.smoothed.roll = lerp(state.smoothed.roll, target.roll, rotationAlpha);
   state.smoothed.yaw = lerp(state.smoothed.yaw, target.yaw, rotationAlpha);
+  state.smoothed.pitch = lerp(state.smoothed.pitch || 0, target.pitch, rotationAlpha);
+  state.smoothed.visibility = lerp(state.smoothed.visibility ?? target.visibility, target.visibility, 0.22);
   state.smoothed.edge = target.edge;
   state.smoothed.faceWidth = target.faceWidth;
   state.smoothed.faceHeight = target.faceHeight;
@@ -411,16 +451,39 @@ function smoothTracking(target) {
 function applyTracking(tracking) {
   const t = smoothTracking(tracking);
   const direction = t.ear === "left" ? -1 : 1;
-  tryOnRoot.visible = true;
+  tryOnRoot.visible = t.visibility > 0.04;
   tryOnRoot.position.set(t.x, 1 - t.y, 0);
   tryOnRoot.scale.set(t.scale * direction, t.scale, t.scale);
-  tryOnRoot.rotation.set(0.05, -t.yaw * 0.9 * direction, -t.roll + direction * t.profileRoll + THREE.MathUtils.degToRad(t.fitRotation));
+  tryOnRoot.rotation.set(0.05 + t.pitch * 0.28, -t.yaw * 0.9 * direction, -t.roll + direction * t.profileRoll + THREE.MathUtils.degToRad(t.fitRotation));
+  setModelOpacity(t.visibility);
 
-  occluder.visible = state.selectedModel !== "inside";
+  occluder.visible = tryOnRoot.visible && state.selectedModel !== "inside";
   occluder.position.set(t.edge.x - direction * t.faceWidth * 0.02, 1 - t.edge.y, 0.22);
   occluder.scale.set(t.faceWidth * 0.11, t.faceHeight * 0.17, 1);
-  alignmentGuide.hidden = true;
-  setStatus(`${t.ear === "left" ? "Левое" : "Правое"} ухо · ${Math.round(state.fps)} FPS`, true);
+  if (state.calibrating && !state.lockedEar && Math.abs(t.yaw) > 0.19) {
+    state.lockedEar = t.ear;
+    calibrateButton.textContent = "Готово — сохранить посадку";
+    setStatus("Ухо зафиксировано · подстройте посадку", true);
+  } else if (t.visibility < 0.42 && state.selectedEar === "auto") {
+    alignmentGuide.hidden = false;
+    setStatus("Поверните голову, чтобы показать ухо");
+  } else {
+    alignmentGuide.hidden = true;
+    setStatus(`${t.ear === "left" ? "Левое" : "Правое"} ухо · ${Math.round(state.fps)} FPS`, true);
+  }
+}
+
+function setModelOpacity(opacity) {
+  tryOnRoot.traverse((child) => {
+    if (!child.isMesh) return;
+    const materials = Array.isArray(child.material) ? child.material : [child.material];
+    materials.forEach((material) => {
+      if (material.userData.baseOpacity === undefined) material.userData.baseOpacity = material.opacity;
+      material.transparent = opacity < 0.995 || material.userData.baseOpacity < 1;
+      material.opacity = material.userData.baseOpacity * opacity;
+      material.depthWrite = opacity > 0.55;
+    });
+  });
 }
 
 function hideTracking() {
@@ -443,7 +506,7 @@ function processResult(result) {
     return;
   }
   const mapPoint = getCoverMapper();
-  const tracking = resolveTracking(landmarks, mapPoint);
+  const tracking = resolveTracking(landmarks, mapPoint, result?.facialTransformationMatrixes?.[0]);
   if (!tracking) return;
   state.lastFaceSeenAt = performance.now();
   state.hasFace = true;
@@ -570,9 +633,30 @@ document.querySelectorAll(".swatch").forEach((button) => {
 document.querySelectorAll(".segmented button").forEach((button) => {
   button.addEventListener("click", () => {
     state.selectedEar = button.dataset.ear;
+    state.lockedEar = button.dataset.ear === "auto" ? null : button.dataset.ear;
     state.smoothed = null;
     document.querySelectorAll(".segmented button").forEach((item) => item.classList.toggle("active", item === button));
   });
+});
+
+calibrateButton.addEventListener("click", () => {
+  if (!state.calibrating) {
+    state.calibrating = true;
+    state.lockedEar = null;
+    state.selectedEar = "auto";
+    state.diagnostics = true;
+    debugButton.setAttribute("aria-pressed", "true");
+    fitControls.hidden = false;
+    calibrateButton.classList.add("active");
+    calibrateButton.textContent = "Поверните голову в профиль…";
+    setStatus("Медленно поверните голову в удобную сторону");
+    document.querySelectorAll(".segmented button").forEach((item) => item.classList.toggle("active", item.dataset.ear === "auto"));
+  } else {
+    state.calibrating = false;
+    calibrateButton.classList.remove("active");
+    calibrateButton.textContent = state.lockedEar ? "Перекалибровать посадку" : "Калибровать посадку";
+    saveFitAdjustments();
+  }
 });
 
 debugButton.addEventListener("click", () => {

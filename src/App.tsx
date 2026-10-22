@@ -140,6 +140,10 @@ export default function App() {
               <button data-ear="left">L</button><button data-ear="auto" className="active">Auto</button><button data-ear="right">R</button>
             </div>
           </div>
+          <button className="fit-assistant-button" id="calibrateButton">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8V4h4M16 4h4v4M20 16v4h-4M8 20H4v-4" /><circle cx="12" cy="12" r="3" /></svg>
+            Калибровать посадку
+          </button>
 
           <div className="fit-controls" id="fitControls" hidden>
             <div className="fit-controls-heading">
