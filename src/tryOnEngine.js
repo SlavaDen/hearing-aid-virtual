@@ -64,7 +64,7 @@ const FIT_PROFILES = {
 };
 
 function defaultFitAdjustments() {
-  return Object.fromEntries(Object.keys(FIT_PROFILES).map((model) => [model, {
+  return Object.fromEntries(["contour", "silk", "inside"].map((model) => [model, {
     left: { x: 0, y: 0, scale: 1, rotation: 0 },
     right: { x: 0, y: 0, scale: 1, rotation: 0 },
   }]));
