@@ -53,7 +53,9 @@ function createRenderer() {
   $("#threeLayer").appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
-  const camera = new THREE.OrthographicCamera(0, 1, 0, 1, -10, 10);
+  // Normalized screen space: x grows right, y grows up. MediaPipe's y grows
+  // down, so applyTracking converts it with `1 - y` exactly once.
+  const camera = new THREE.OrthographicCamera(0, 1, 1, 0, -10, 10);
   camera.position.z = 4;
 
   scene.add(new THREE.HemisphereLight(0xffffff, 0x52675c, 2.15));
@@ -266,34 +268,80 @@ function showCameraError(error) {
   startButton.textContent = "Попробовать снова";
 }
 
-function resolveTracking(landmarks) {
-  const leftEdge = landmarks[234];
-  const rightEdge = landmarks[454];
-  const leftEye = landmarks[33];
-  const rightEye = landmarks[263];
-  const nose = landmarks[1];
-  const chin = landmarks[152];
-  const forehead = landmarks[10];
+function getCoverMapper() {
+  const containerWidth = Math.max(cameraStage.clientWidth, 1);
+  const containerHeight = Math.max(cameraStage.clientHeight, 1);
+  const sourceWidth = state.mode === "photo" ? photo.naturalWidth : video.videoWidth;
+  const sourceHeight = state.mode === "photo" ? photo.naturalHeight : video.videoHeight;
+  if (!sourceWidth || !sourceHeight) return (point) => point;
+
+  // The video/photo uses object-fit: cover. MediaPipe reports coordinates in
+  // the uncropped source frame, while Three.js draws in the visible container.
+  const scale = Math.max(containerWidth / sourceWidth, containerHeight / sourceHeight);
+  const renderedWidth = sourceWidth * scale;
+  const renderedHeight = sourceHeight * scale;
+  const offsetX = (containerWidth - renderedWidth) / 2;
+  const offsetY = (containerHeight - renderedHeight) / 2;
+
+  return (point) => ({
+    x: (point.x * renderedWidth + offsetX) / containerWidth,
+    y: (point.y * renderedHeight + offsetY) / containerHeight,
+    z: point.z * renderedWidth / containerWidth,
+  });
+}
+
+function weightedPoint(points, weights) {
+  const total = weights.reduce((sum, weight) => sum + weight, 0);
+  return {
+    x: points.reduce((sum, point, index) => sum + point.x * weights[index], 0) / total,
+    y: points.reduce((sum, point, index) => sum + point.y * weights[index], 0) / total,
+    z: points.reduce((sum, point, index) => sum + (point.z || 0) * weights[index], 0) / total,
+  };
+}
+
+function resolveTracking(landmarks, mapPoint) {
+  // A single face-outline landmark moves several pixels with expression and
+  // yaw. Blend temple, cheek and jaw landmarks into a much steadier ear proxy.
+  const leftUpper = mapPoint(landmarks[127]);
+  const leftMiddle = mapPoint(landmarks[234]);
+  const leftLower = mapPoint(landmarks[93]);
+  const rightUpper = mapPoint(landmarks[356]);
+  const rightMiddle = mapPoint(landmarks[454]);
+  const rightLower = mapPoint(landmarks[323]);
+  const leftEdge = weightedPoint([leftUpper, leftMiddle, leftLower], [0.34, 0.46, 0.2]);
+  const rightEdge = weightedPoint([rightUpper, rightMiddle, rightLower], [0.34, 0.46, 0.2]);
+  const leftEye = mapPoint(landmarks[33]);
+  const rightEye = mapPoint(landmarks[263]);
+  const nose = mapPoint(landmarks[1]);
+  const chin = mapPoint(landmarks[152]);
+  const forehead = mapPoint(landmarks[10]);
   if (!leftEdge || !rightEdge || !nose) return null;
 
   const faceWidth = distance(leftEdge, rightEdge);
   const faceHeight = distance(forehead, chin);
   const leftSpan = Math.abs(nose.x - leftEdge.x);
   const rightSpan = Math.abs(rightEdge.x - nose.x);
-  const yaw = clamp((leftSpan - rightSpan) / Math.max(leftSpan + rightSpan, 0.001), -0.72, 0.72);
+  const rawYaw = (leftSpan - rightSpan) / Math.max(leftSpan + rightSpan, 0.001);
+  const yaw = clamp(rawYaw * 1.7, -0.9, 0.9);
   const roll = Math.atan2(rightEye.y - leftEye.y, rightEye.x - leftEye.x);
 
   let ear = state.selectedEar;
   if (ear === "auto") {
-    if (Math.abs(yaw) < 0.075 && state.smoothed?.ear) ear = state.smoothed.ear;
-    else ear = yaw >= 0 ? "right" : "left";
+    // Hysteresis prevents rapid left/right switching when looking forward.
+    const current = state.smoothed?.ear;
+    if (current === "left" && yaw < 0.16) ear = "left";
+    else if (current === "right" && yaw > -0.16) ear = "right";
+    else if (yaw > 0.1) ear = "right";
+    else if (yaw < -0.1) ear = "left";
+    else ear = current || "right";
   }
   const edge = ear === "left" ? leftEdge : rightEdge;
   const direction = ear === "left" ? -1 : 1;
-  const modelOffset = state.selectedModel === "inside" ? 0.005 : 0.026;
-  const x = edge.x + direction * faceWidth * modelOffset;
-  const y = edge.y - faceHeight * (state.selectedModel === "inside" ? -0.005 : 0.055);
-  const scale = faceWidth * (state.selectedModel === "inside" ? 0.21 : state.selectedModel === "silk" ? 0.255 : 0.29);
+  const outward = state.selectedModel === "inside" ? 0.018 : 0.068 + Math.abs(yaw) * 0.018;
+  const x = edge.x + direction * faceWidth * outward;
+  const y = edge.y - faceHeight * (state.selectedModel === "inside" ? -0.012 : 0.072);
+  // Face height changes substantially less than visible face width during yaw.
+  const scale = faceHeight * (state.selectedModel === "inside" ? 0.16 : state.selectedModel === "silk" ? 0.205 : 0.23);
 
   return { x, y, scale, roll, yaw, ear, edge, faceWidth, faceHeight };
 }
@@ -303,8 +351,8 @@ function smoothTracking(target) {
     state.smoothed = { ...target };
     return state.smoothed;
   }
-  const positionAlpha = 0.29;
-  const rotationAlpha = 0.19;
+  const positionAlpha = 0.22;
+  const rotationAlpha = 0.16;
   state.smoothed.x = lerp(state.smoothed.x, target.x, positionAlpha);
   state.smoothed.y = lerp(state.smoothed.y, target.y, positionAlpha);
   state.smoothed.scale = lerp(state.smoothed.scale, target.scale, 0.22);
@@ -325,8 +373,8 @@ function applyTracking(tracking) {
   tryOnRoot.rotation.set(0.05, -t.yaw * 0.9 * direction, -t.roll + direction * 0.05);
 
   occluder.visible = state.selectedModel !== "inside";
-  occluder.position.set(t.edge.x - direction * t.faceWidth * 0.012, 1 - t.edge.y, 0.22);
-  occluder.scale.set(t.faceWidth * 0.095, t.faceHeight * 0.15, 1);
+  occluder.position.set(t.edge.x - direction * t.faceWidth * 0.02, 1 - t.edge.y, 0.22);
+  occluder.scale.set(t.faceWidth * 0.11, t.faceHeight * 0.17, 1);
   alignmentGuide.hidden = true;
   setStatus(`${t.ear === "left" ? "Левое" : "Правое"} ухо · ${Math.round(state.fps)} FPS`, true);
 }
@@ -346,11 +394,12 @@ function processResult(result) {
     drawDiagnostics(null);
     return;
   }
-  const tracking = resolveTracking(landmarks);
+  const mapPoint = getCoverMapper();
+  const tracking = resolveTracking(landmarks, mapPoint);
   if (!tracking) return;
   state.hasFace = true;
   applyTracking(tracking);
-  drawDiagnostics(landmarks, tracking);
+  drawDiagnostics(landmarks, tracking, mapPoint);
 }
 
 function updateFps(now) {
@@ -375,14 +424,14 @@ function trackVideoFrame(now) {
   requestAnimationFrame(trackVideoFrame);
 }
 
-function drawDiagnostics(landmarks, tracking) {
+function drawDiagnostics(landmarks, tracking, mapPoint = (point) => point) {
   const width = cameraStage.clientWidth;
   const height = cameraStage.clientHeight;
   debugContext.clearRect(0, 0, width, height);
   if (!state.diagnostics || !landmarks) return;
   debugContext.fillStyle = "rgba(116, 234, 166, .72)";
   for (let i = 0; i < landmarks.length; i += 4) {
-    const point = landmarks[i];
+    const point = mapPoint(landmarks[i]);
     debugContext.beginPath();
     debugContext.arc(point.x * width, point.y * height, 1.25, 0, Math.PI * 2);
     debugContext.fill();
