@@ -20,6 +20,13 @@ const statusText = $("#statusText");
 const alignmentGuide = $("#alignmentGuide");
 const flipButton = $("#flipButton");
 const debugButton = $("#debugButton");
+const fitControls = $("#fitControls");
+const fitInputs = {
+  x: $("#fitX"),
+  y: $("#fitY"),
+  scale: $("#fitScale"),
+  rotation: $("#fitRotation"),
+};
 const debugCanvas = $("#debugLayer");
 const debugContext = debugCanvas.getContext("2d");
 
@@ -39,11 +46,42 @@ const state = {
   fps: 0,
   hasFace: false,
   smoothed: null,
+  lastFaceSeenAt: 0,
+  fitAdjustments: loadFitAdjustments(),
 };
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const lerp = (from, to, amount) => from + (to - from) * amount;
 const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+const FIT_PROFILES = {
+  contour: { outward: 0.068, vertical: 0.072, scale: 0.23, roll: 0.05 },
+  silk: { outward: 0.058, vertical: 0.063, scale: 0.205, roll: 0.035 },
+  inside: { outward: 0.018, vertical: -0.012, scale: 0.16, roll: 0 },
+};
+
+function defaultFitAdjustments() {
+  return Object.fromEntries(Object.keys(FIT_PROFILES).map((model) => [model, { x: 0, y: 0, scale: 1, rotation: 0 }]));
+}
+
+function loadFitAdjustments() {
+  const fallback = {
+    contour: { x: 0, y: 0, scale: 1, rotation: 0 },
+    silk: { x: 0, y: 0, scale: 1, rotation: 0 },
+    inside: { x: 0, y: 0, scale: 1, rotation: 0 },
+  };
+  try {
+    const saved = JSON.parse(localStorage.getItem("auris-fit-adjustments") || "null");
+    if (!saved) return fallback;
+    return Object.fromEntries(Object.entries(fallback).map(([model, values]) => [model, { ...values, ...(saved[model] || {}) }]));
+  } catch {
+    return fallback;
+  }
+}
+
+function saveFitAdjustments() {
+  try { localStorage.setItem("auris-fit-adjustments", JSON.stringify(state.fitAdjustments)); } catch { /* private browsing */ }
+}
 
 function createRenderer() {
   const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, powerPreference: "high-performance" });
@@ -337,13 +375,15 @@ function resolveTracking(landmarks, mapPoint) {
   }
   const edge = ear === "left" ? leftEdge : rightEdge;
   const direction = ear === "left" ? -1 : 1;
-  const outward = state.selectedModel === "inside" ? 0.018 : 0.068 + Math.abs(yaw) * 0.018;
+  const profile = FIT_PROFILES[state.selectedModel];
+  const fit = state.fitAdjustments[state.selectedModel];
+  const outward = profile.outward + (state.selectedModel === "inside" ? 0 : Math.abs(yaw) * 0.018) + fit.x / 100;
   const x = edge.x + direction * faceWidth * outward;
-  const y = edge.y - faceHeight * (state.selectedModel === "inside" ? -0.012 : 0.072);
+  const y = edge.y - faceHeight * (profile.vertical + fit.y / 100);
   // Face height changes substantially less than visible face width during yaw.
-  const scale = faceHeight * (state.selectedModel === "inside" ? 0.16 : state.selectedModel === "silk" ? 0.205 : 0.23);
+  const scale = faceHeight * profile.scale * fit.scale;
 
-  return { x, y, scale, roll, yaw, ear, edge, faceWidth, faceHeight };
+  return { x, y, scale, roll, yaw, ear, edge, faceWidth, faceHeight, fitRotation: fit.rotation, profileRoll: profile.roll };
 }
 
 function smoothTracking(target) {
@@ -351,16 +391,20 @@ function smoothTracking(target) {
     state.smoothed = { ...target };
     return state.smoothed;
   }
-  const positionAlpha = 0.22;
-  const rotationAlpha = 0.16;
+  const normalizedMotion = Math.hypot(target.x - state.smoothed.x, target.y - state.smoothed.y) / Math.max(state.smoothed.scale, 0.001);
+  const positionAlpha = clamp(0.11 + normalizedMotion * 0.42, 0.11, 0.48);
+  const rotationAlpha = clamp(0.12 + Math.abs(target.yaw - state.smoothed.yaw) * 0.32, 0.12, 0.34);
   state.smoothed.x = lerp(state.smoothed.x, target.x, positionAlpha);
   state.smoothed.y = lerp(state.smoothed.y, target.y, positionAlpha);
-  state.smoothed.scale = lerp(state.smoothed.scale, target.scale, 0.22);
+  const boundedScale = clamp(target.scale, state.smoothed.scale * 0.94, state.smoothed.scale * 1.06);
+  state.smoothed.scale = lerp(state.smoothed.scale, boundedScale, 0.16);
   state.smoothed.roll = lerp(state.smoothed.roll, target.roll, rotationAlpha);
   state.smoothed.yaw = lerp(state.smoothed.yaw, target.yaw, rotationAlpha);
   state.smoothed.edge = target.edge;
   state.smoothed.faceWidth = target.faceWidth;
   state.smoothed.faceHeight = target.faceHeight;
+  state.smoothed.fitRotation = target.fitRotation;
+  state.smoothed.profileRoll = target.profileRoll;
   return state.smoothed;
 }
 
@@ -370,7 +414,7 @@ function applyTracking(tracking) {
   tryOnRoot.visible = true;
   tryOnRoot.position.set(t.x, 1 - t.y, 0);
   tryOnRoot.scale.set(t.scale * direction, t.scale, t.scale);
-  tryOnRoot.rotation.set(0.05, -t.yaw * 0.9 * direction, -t.roll + direction * 0.05);
+  tryOnRoot.rotation.set(0.05, -t.yaw * 0.9 * direction, -t.roll + direction * t.profileRoll + THREE.MathUtils.degToRad(t.fitRotation));
 
   occluder.visible = state.selectedModel !== "inside";
   occluder.position.set(t.edge.x - direction * t.faceWidth * 0.02, 1 - t.edge.y, 0.22);
@@ -390,6 +434,10 @@ function hideTracking() {
 function processResult(result) {
   const landmarks = result?.faceLandmarks?.[0];
   if (!landmarks) {
+    if (state.mode === "video" && performance.now() - state.lastFaceSeenAt < 280 && state.smoothed) {
+      setStatus("Стабилизируем трекинг…", true);
+      return;
+    }
     hideTracking();
     drawDiagnostics(null);
     return;
@@ -397,6 +445,7 @@ function processResult(result) {
   const mapPoint = getCoverMapper();
   const tracking = resolveTracking(landmarks, mapPoint);
   if (!tracking) return;
+  state.lastFaceSeenAt = performance.now();
   state.hasFace = true;
   applyTracking(tracking);
   drawDiagnostics(landmarks, tracking, mapPoint);
@@ -499,6 +548,7 @@ document.querySelectorAll(".model-card").forEach((button) => {
     });
     state.smoothed = null;
     updateModelVisibility();
+    syncFitControls();
     webgl.renderer.render(webgl.scene, webgl.camera);
   });
 });
@@ -528,8 +578,39 @@ document.querySelectorAll(".segmented button").forEach((button) => {
 debugButton.addEventListener("click", () => {
   state.diagnostics = !state.diagnostics;
   debugButton.setAttribute("aria-pressed", String(state.diagnostics));
+  fitControls.hidden = !state.diagnostics;
   if (!state.diagnostics) debugContext.clearRect(0, 0, cameraStage.clientWidth, cameraStage.clientHeight);
 });
+
+function syncFitControls() {
+  const fit = state.fitAdjustments[state.selectedModel];
+  fitInputs.x.value = String(Math.round(fit.x));
+  fitInputs.y.value = String(Math.round(fit.y));
+  fitInputs.scale.value = String(Math.round(fit.scale * 100));
+  fitInputs.rotation.value = String(Math.round(fit.rotation));
+  $("#fitXValue").value = `${Math.round(fit.x)}`;
+  $("#fitYValue").value = `${Math.round(fit.y)}`;
+  $("#fitScaleValue").value = `${Math.round(fit.scale * 100)}%`;
+  $("#fitRotationValue").value = `${Math.round(fit.rotation)}°`;
+}
+
+Object.entries(fitInputs).forEach(([key, input]) => {
+  input.addEventListener("input", () => {
+    const fit = state.fitAdjustments[state.selectedModel];
+    fit[key] = key === "scale" ? Number(input.value) / 100 : Number(input.value);
+    state.smoothed = null;
+    saveFitAdjustments();
+    syncFitControls();
+  });
+});
+
+$("#resetFitButton").addEventListener("click", () => {
+  state.fitAdjustments[state.selectedModel] = { x: 0, y: 0, scale: 1, rotation: 0 };
+  state.smoothed = null;
+  saveFitAdjustments();
+  syncFitControls();
+});
+syncFitControls();
 
 const helpDialog = $("#helpDialog");
 $("#helpButton").addEventListener("click", () => helpDialog.showModal());

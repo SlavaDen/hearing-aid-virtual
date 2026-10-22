@@ -141,6 +141,29 @@ export default function App() {
             </div>
           </div>
 
+          <div className="fit-controls" id="fitControls" hidden>
+            <div className="fit-controls-heading">
+              <div><p className="step-label">Diagnostics</p><h3>Точная посадка</h3></div>
+              <button className="compact-button" id="resetFitButton">Сбросить</button>
+            </div>
+            <label>
+              <span>По горизонтали <output id="fitXValue">0</output></span>
+              <input id="fitX" type="range" min="-15" max="15" step="1" defaultValue="0" />
+            </label>
+            <label>
+              <span>По вертикали <output id="fitYValue">0</output></span>
+              <input id="fitY" type="range" min="-15" max="15" step="1" defaultValue="0" />
+            </label>
+            <label>
+              <span>Размер <output id="fitScaleValue">100%</output></span>
+              <input id="fitScale" type="range" min="70" max="130" step="1" defaultValue="100" />
+            </label>
+            <label>
+              <span>Наклон <output id="fitRotationValue">0°</output></span>
+              <input id="fitRotation" type="range" min="-25" max="25" step="1" defaultValue="0" />
+            </label>
+          </div>
+
           <div className="fit-note">
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 8v4l2.5 1.5" /></svg>
             <p><strong>Совет для точной посадки</strong><br />Держите лицо на расстоянии 50–80 см и медленно поворачивайте голову.</p>

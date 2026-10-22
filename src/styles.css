@@ -97,6 +97,13 @@ h1 em { color: var(--sage); font-weight: 400; }
 .segmented { display: flex; padding: 3px; background: #efede7; border-radius: 9px; }
 .segmented button { min-width: 30px; height: 30px; padding: 0 7px; border: 0; border-radius: 7px; color: var(--muted); background: transparent; cursor: pointer; font-size: 10px; font-weight: 700; }
 .segmented button.active { color: var(--ink); background: white; box-shadow: 0 2px 7px rgba(0,0,0,.08); }
+.fit-controls { margin-top: 22px; padding: 16px; border: 1px dashed rgba(82,103,92,.3); border-radius: 13px; background: #fafbf8; }
+.fit-controls-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.fit-controls-heading h3 { margin: 0; font: 400 18px/1.1 Georgia, serif; }
+.fit-controls label { display: grid; gap: 5px; margin-top: 10px; }
+.fit-controls label span { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; }
+.fit-controls output { color: var(--sage-dark); font-weight: 750; }
+.fit-controls input[type="range"] { width: 100%; accent-color: var(--sage); cursor: pointer; }
 .fit-note { display: flex; gap: 11px; margin-top: 27px; padding: 14px; color: #405348; background: #edf1ec; border-radius: 13px; }
 .fit-note svg { width: 20px; min-width: 20px; fill: none; stroke: currentColor; stroke-width: 1.5; }
 .fit-note p { margin: 0; font-size: 10px; line-height: 1.5; }
