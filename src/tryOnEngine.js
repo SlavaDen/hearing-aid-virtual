@@ -40,15 +40,15 @@ const state = {
   facingMode: "user",
   selectedModel: "contour",
   selectedColor: "#c7aa83",
-  selectedEar: "auto",
+  displayMode: "both",
+  activeFitEar: "left",
   diagnostics: false,
   lastVideoTime: -1,
   lastFrameAt: performance.now(),
   fps: 0,
   hasFace: false,
-  smoothed: null,
+  smoothed: { left: null, right: null },
   lastFaceSeenAt: 0,
-  lockedEar: null,
   calibrating: false,
   fitAdjustments: loadFitAdjustments(),
 };
@@ -64,26 +64,36 @@ const FIT_PROFILES = {
 };
 
 function defaultFitAdjustments() {
-  return Object.fromEntries(Object.keys(FIT_PROFILES).map((model) => [model, { x: 0, y: 0, scale: 1, rotation: 0 }]));
+  return Object.fromEntries(Object.keys(FIT_PROFILES).map((model) => [model, {
+    left: { x: 0, y: 0, scale: 1, rotation: 0 },
+    right: { x: 0, y: 0, scale: 1, rotation: 0 },
+  }]));
 }
 
 function loadFitAdjustments() {
-  const fallback = {
-    contour: { x: 0, y: 0, scale: 1, rotation: 0 },
-    silk: { x: 0, y: 0, scale: 1, rotation: 0 },
-    inside: { x: 0, y: 0, scale: 1, rotation: 0 },
-  };
+  const fallback = defaultFitAdjustments();
   try {
-    const saved = JSON.parse(localStorage.getItem("auris-fit-adjustments") || "null");
-    if (!saved) return fallback;
-    return Object.fromEntries(Object.entries(fallback).map(([model, values]) => [model, { ...values, ...(saved[model] || {}) }]));
+    const saved = JSON.parse(localStorage.getItem("auris-fit-adjustments-v2") || "null");
+    if (saved) {
+      return Object.fromEntries(Object.entries(fallback).map(([model, ears]) => [model, {
+        left: { ...ears.left, ...(saved[model]?.left || {}) },
+        right: { ...ears.right, ...(saved[model]?.right || {}) },
+      }]));
+    }
+    // Preserve an existing single-ear calibration by applying it to both ears.
+    const legacy = JSON.parse(localStorage.getItem("auris-fit-adjustments") || "null");
+    if (!legacy) return fallback;
+    return Object.fromEntries(Object.entries(fallback).map(([model, ears]) => [model, {
+      left: { ...ears.left, ...(legacy[model] || {}) },
+      right: { ...ears.right, ...(legacy[model] || {}) },
+    }]));
   } catch {
     return fallback;
   }
 }
 
 function saveFitAdjustments() {
-  try { localStorage.setItem("auris-fit-adjustments", JSON.stringify(state.fitAdjustments)); } catch { /* private browsing */ }
+  try { localStorage.setItem("auris-fit-adjustments-v2", JSON.stringify(state.fitAdjustments)); } catch { /* private browsing */ }
 }
 
 function createRenderer() {
@@ -119,6 +129,7 @@ const caseMaterial = new THREE.MeshPhysicalMaterial({
   clearcoat: 0.72,
   clearcoatRoughness: 0.2,
 });
+caseMaterial.userData.role = "case";
 const trimMaterial = new THREE.MeshStandardMaterial({ color: 0x272b29, roughness: 0.33, metalness: 0.16 });
 const tubeMaterial = new THREE.MeshPhysicalMaterial({
   color: 0xf1dbbc,
@@ -179,28 +190,46 @@ function createInside() {
   return group;
 }
 
-const tryOnRoot = new THREE.Group();
-tryOnRoot.visible = false;
-webgl.scene.add(tryOnRoot);
-
-const modelGroups = {
+const modelTemplates = {
   contour: createContour(),
   silk: createSilk(),
   inside: createInside(),
 };
-Object.values(modelGroups).forEach((model) => tryOnRoot.add(model));
 
-const occluder = new THREE.Mesh(
-  new THREE.CircleGeometry(1, 48),
-  new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: true, depthTest: true, side: THREE.DoubleSide }),
-);
-occluder.renderOrder = 0;
-occluder.position.z = 0.26;
-webgl.scene.add(occluder);
-occluder.visible = false;
+function cloneModel(template) {
+  const clone = template.clone(true);
+  clone.traverse((child) => {
+    if (!child.isMesh) return;
+    child.material = Array.isArray(child.material)
+      ? child.material.map((material) => material.clone())
+      : child.material.clone();
+  });
+  return clone;
+}
+
+const earScenes = Object.fromEntries(["left", "right"].map((ear) => {
+  const root = new THREE.Group();
+  root.visible = false;
+  const models = Object.fromEntries(Object.entries(modelTemplates).map(([name, template]) => {
+    const model = cloneModel(template);
+    root.add(model);
+    return [name, model];
+  }));
+  const occluder = new THREE.Mesh(
+    new THREE.CircleGeometry(1, 48),
+    new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: true, depthTest: true, side: THREE.DoubleSide }),
+  );
+  occluder.renderOrder = 0;
+  occluder.position.z = 0.26;
+  occluder.visible = false;
+  webgl.scene.add(root, occluder);
+  return [ear, { root, models, occluder }];
+}));
 
 function updateModelVisibility() {
-  Object.entries(modelGroups).forEach(([name, group]) => { group.visible = name === state.selectedModel; });
+  Object.values(earScenes).forEach(({ models }) => {
+    Object.entries(models).forEach(([name, group]) => { group.visible = name === state.selectedModel; });
+  });
 }
 updateModelVisibility();
 
@@ -221,7 +250,7 @@ async function ensureLandmarker(runningMode = "VIDEO") {
     await state.faceLandmarker.setOptions({ runningMode });
     return state.faceLandmarker;
   }
-  statusText.textContent = "Загружаем трекинг…";
+  statusText.textContent = "Loading tracking…";
   const vision = await FilesetResolver.forVisionTasks(WASM_ROOT);
   state.faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
     baseOptions: { modelAssetPath: FACE_MODEL, delegate: "GPU" },
@@ -258,7 +287,7 @@ async function startCamera(forceFacingMode) {
   state.loading = true;
   startButton.disabled = true;
   showExperience("video");
-  setStatus("Запрашиваем камеру…");
+  setStatus("Requesting camera access…");
   try {
     stopCamera();
     if (forceFacingMode) state.facingMode = forceFacingMode;
@@ -276,7 +305,7 @@ async function startCamera(forceFacingMode) {
     await ensureLandmarker("VIDEO");
     state.running = true;
     state.lastVideoTime = -1;
-    setStatus("Ищем лицо…");
+    setStatus("Looking for a face…");
     requestAnimationFrame(trackVideoFrame);
   } catch (error) {
     console.error(error);
@@ -299,14 +328,16 @@ function showCameraError(error) {
   stageStatus.hidden = true;
   alignmentGuide.hidden = true;
   flipButton.hidden = true;
-  tryOnRoot.visible = false;
-  occluder.visible = false;
+  Object.values(earScenes).forEach(({ root, occluder }) => {
+    root.visible = false;
+    occluder.visible = false;
+  });
   const denied = error?.name === "NotAllowedError";
-  emptyState.querySelector("h2").textContent = denied ? "Нужен доступ к камере" : "Камера недоступна";
+  emptyState.querySelector("h2").textContent = denied ? "Camera access is required" : "Camera unavailable";
   emptyState.querySelector("p").innerHTML = denied
-    ? "Разрешите доступ в настройках браузера<br />или загрузите фотографию."
-    : "Попробуйте другую камеру<br />или загрузите фотографию.";
-  startButton.textContent = "Попробовать снова";
+    ? "Allow access in your browser settings<br />or upload a photo."
+    : "Try another camera<br />or upload a photo.";
+  startButton.textContent = "Try again";
 }
 
 function getCoverMapper() {
@@ -367,7 +398,7 @@ function extractHeadPose(matrixData, landmarkYaw, landmarkRoll) {
   }
 }
 
-function resolveTracking(landmarks, mapPoint, transformationMatrix) {
+function resolveTracking(landmarks, mapPoint, transformationMatrix, ear) {
   // A single face-outline landmark moves several pixels with expression and
   // yaw. Blend temple, cheek and jaw landmarks into a much steadier ear proxy.
   const leftUpper = mapPoint(landmarks[127]);
@@ -397,84 +428,66 @@ function resolveTracking(landmarks, mapPoint, transformationMatrix) {
   const roll = headPose ? landmarkRoll * 0.45 + headPose.roll * 0.55 : landmarkRoll;
   const pitch = headPose?.pitch || 0;
 
-  let ear = state.selectedEar;
-  if (ear === "auto") {
-    if (state.lockedEar) ear = state.lockedEar;
-    else {
-    // Hysteresis prevents rapid left/right switching when looking forward.
-    const current = state.smoothed?.ear;
-    if (current === "left" && yaw < 0.16) ear = "left";
-    else if (current === "right" && yaw > -0.16) ear = "right";
-    else if (yaw > 0.1) ear = "right";
-    else if (yaw < -0.1) ear = "left";
-    else ear = current || "right";
-    }
-  }
   const edge = ear === "left" ? leftEdge : rightEdge;
   const direction = ear === "left" ? -1 : 1;
   const profile = FIT_PROFILES[state.selectedModel];
-  const fit = state.fitAdjustments[state.selectedModel];
+  const fit = state.fitAdjustments[state.selectedModel][ear];
   const outward = profile.outward + (state.selectedModel === "inside" ? 0 : Math.abs(yaw) * 0.018) + fit.x / 100;
   const x = edge.x + direction * faceWidth * outward;
   const y = edge.y - faceHeight * (profile.vertical + fit.y / 100);
   // Face height changes substantially less than visible face width during yaw.
   const scale = faceHeight * profile.scale * fit.scale;
 
-  const visibility = state.selectedEar === "auto" ? clamp((Math.abs(yaw) - 0.025) / 0.11, 0, 1) : 1;
+  let visibility = state.displayMode === "both" || state.displayMode === ear ? 1 : 0;
+  if (state.displayMode === "both" && Math.abs(yaw) > 0.08) {
+    const nearEar = yaw >= 0 ? "right" : "left";
+    if (ear !== nearEar) visibility = clamp(1 - (Math.abs(yaw) - 0.08) / 0.48, 0, 1);
+  }
   return { x, y, scale, roll, pitch, yaw, ear, edge, faceWidth, faceHeight, visibility, fitRotation: fit.rotation, profileRoll: profile.roll };
 }
 
-function smoothTracking(target) {
-  if (!state.smoothed || state.smoothed.ear !== target.ear) {
-    state.smoothed = { ...target };
-    return state.smoothed;
+function smoothTracking(target, ear) {
+  if (!state.smoothed[ear]) {
+    state.smoothed[ear] = { ...target };
+    return state.smoothed[ear];
   }
-  const normalizedMotion = Math.hypot(target.x - state.smoothed.x, target.y - state.smoothed.y) / Math.max(state.smoothed.scale, 0.001);
+  const current = state.smoothed[ear];
+  const normalizedMotion = Math.hypot(target.x - current.x, target.y - current.y) / Math.max(current.scale, 0.001);
   const positionAlpha = clamp(0.11 + normalizedMotion * 0.42, 0.11, 0.48);
-  const rotationAlpha = clamp(0.12 + Math.abs(target.yaw - state.smoothed.yaw) * 0.32, 0.12, 0.34);
-  state.smoothed.x = lerp(state.smoothed.x, target.x, positionAlpha);
-  state.smoothed.y = lerp(state.smoothed.y, target.y, positionAlpha);
-  const boundedScale = clamp(target.scale, state.smoothed.scale * 0.94, state.smoothed.scale * 1.06);
-  state.smoothed.scale = lerp(state.smoothed.scale, boundedScale, 0.16);
-  state.smoothed.roll = lerp(state.smoothed.roll, target.roll, rotationAlpha);
-  state.smoothed.yaw = lerp(state.smoothed.yaw, target.yaw, rotationAlpha);
-  state.smoothed.pitch = lerp(state.smoothed.pitch || 0, target.pitch, rotationAlpha);
-  state.smoothed.visibility = lerp(state.smoothed.visibility ?? target.visibility, target.visibility, 0.22);
-  state.smoothed.edge = target.edge;
-  state.smoothed.faceWidth = target.faceWidth;
-  state.smoothed.faceHeight = target.faceHeight;
-  state.smoothed.fitRotation = target.fitRotation;
-  state.smoothed.profileRoll = target.profileRoll;
-  return state.smoothed;
+  const rotationAlpha = clamp(0.12 + Math.abs(target.yaw - current.yaw) * 0.32, 0.12, 0.34);
+  current.x = lerp(current.x, target.x, positionAlpha);
+  current.y = lerp(current.y, target.y, positionAlpha);
+  const boundedScale = clamp(target.scale, current.scale * 0.94, current.scale * 1.06);
+  current.scale = lerp(current.scale, boundedScale, 0.16);
+  current.roll = lerp(current.roll, target.roll, rotationAlpha);
+  current.yaw = lerp(current.yaw, target.yaw, rotationAlpha);
+  current.pitch = lerp(current.pitch || 0, target.pitch, rotationAlpha);
+  current.visibility = lerp(current.visibility ?? target.visibility, target.visibility, 0.22);
+  current.edge = target.edge;
+  current.faceWidth = target.faceWidth;
+  current.faceHeight = target.faceHeight;
+  current.fitRotation = target.fitRotation;
+  current.profileRoll = target.profileRoll;
+  return current;
 }
 
-function applyTracking(tracking) {
-  const t = smoothTracking(tracking);
+function applyTracking(tracking, ear) {
+  const t = smoothTracking(tracking, ear);
+  const { root, occluder } = earScenes[ear];
   const direction = t.ear === "left" ? -1 : 1;
-  tryOnRoot.visible = t.visibility > 0.04;
-  tryOnRoot.position.set(t.x, 1 - t.y, 0);
-  tryOnRoot.scale.set(t.scale * direction, t.scale, t.scale);
-  tryOnRoot.rotation.set(0.05 + t.pitch * 0.28, -t.yaw * 0.9 * direction, -t.roll + direction * t.profileRoll + THREE.MathUtils.degToRad(t.fitRotation));
-  setModelOpacity(t.visibility);
+  root.visible = t.visibility > 0.04;
+  root.position.set(t.x, 1 - t.y, 0);
+  root.scale.set(t.scale * direction, t.scale, t.scale);
+  root.rotation.set(0.05 + t.pitch * 0.28, -t.yaw * 0.9 * direction, -t.roll + direction * t.profileRoll + THREE.MathUtils.degToRad(t.fitRotation));
+  setModelOpacity(root, t.visibility);
 
-  occluder.visible = tryOnRoot.visible && state.selectedModel !== "inside";
+  occluder.visible = root.visible && state.selectedModel !== "inside";
   occluder.position.set(t.edge.x - direction * t.faceWidth * 0.02, 1 - t.edge.y, 0.22);
   occluder.scale.set(t.faceWidth * 0.11, t.faceHeight * 0.17, 1);
-  if (state.calibrating && !state.lockedEar && Math.abs(t.yaw) > 0.19) {
-    state.lockedEar = t.ear;
-    calibrateButton.textContent = "Готово — сохранить посадку";
-    setStatus("Ухо зафиксировано · подстройте посадку", true);
-  } else if (t.visibility < 0.42 && state.selectedEar === "auto") {
-    alignmentGuide.hidden = false;
-    setStatus("Поверните голову, чтобы показать ухо");
-  } else {
-    alignmentGuide.hidden = true;
-    setStatus(`${t.ear === "left" ? "Левое" : "Правое"} ухо · ${Math.round(state.fps)} FPS`, true);
-  }
 }
 
-function setModelOpacity(opacity) {
-  tryOnRoot.traverse((child) => {
+function setModelOpacity(root, opacity) {
+  root.traverse((child) => {
     if (!child.isMesh) return;
     const materials = Array.isArray(child.material) ? child.material : [child.material];
     materials.forEach((material) => {
@@ -487,18 +500,20 @@ function setModelOpacity(opacity) {
 }
 
 function hideTracking() {
-  tryOnRoot.visible = false;
-  occluder.visible = false;
+  Object.values(earScenes).forEach(({ root, occluder }) => {
+    root.visible = false;
+    occluder.visible = false;
+  });
   state.hasFace = false;
   alignmentGuide.hidden = false;
-  setStatus("Поместите лицо в кадр");
+  setStatus("Keep your face in frame");
 }
 
 function processResult(result) {
   const landmarks = result?.faceLandmarks?.[0];
   if (!landmarks) {
-    if (state.mode === "video" && performance.now() - state.lastFaceSeenAt < 280 && state.smoothed) {
-      setStatus("Стабилизируем трекинг…", true);
+    if (state.mode === "video" && performance.now() - state.lastFaceSeenAt < 280 && (state.smoothed.left || state.smoothed.right)) {
+      setStatus("Stabilising tracking…", true);
       return;
     }
     hideTracking();
@@ -506,12 +521,19 @@ function processResult(result) {
     return;
   }
   const mapPoint = getCoverMapper();
-  const tracking = resolveTracking(landmarks, mapPoint, result?.facialTransformationMatrixes?.[0]);
-  if (!tracking) return;
+  const trackings = Object.fromEntries(["left", "right"].map((ear) => [
+    ear,
+    resolveTracking(landmarks, mapPoint, result?.facialTransformationMatrixes?.[0], ear),
+  ]));
+  if (!trackings.left || !trackings.right) return;
   state.lastFaceSeenAt = performance.now();
   state.hasFace = true;
-  applyTracking(tracking);
-  drawDiagnostics(landmarks, tracking, mapPoint);
+  applyTracking(trackings.left, "left");
+  applyTracking(trackings.right, "right");
+  alignmentGuide.hidden = Math.abs(trackings.left.yaw) > 0.08;
+  const displayLabel = state.displayMode === "both" ? "Both ears" : `${state.displayMode === "left" ? "Left" : "Right"} ear`;
+  setStatus(`${displayLabel} · ${Math.round(state.fps)} FPS`, true);
+  drawDiagnostics(landmarks, trackings[state.activeFitEar], mapPoint);
 }
 
 function updateFps(now) {
@@ -570,7 +592,7 @@ async function handlePhoto(file) {
   state.loading = true;
   stopCamera();
   showExperience("photo");
-  setStatus("Анализируем фото…");
+  setStatus("Analysing photo…");
   const objectUrl = URL.createObjectURL(file);
   try {
     await new Promise((resolve, reject) => {
@@ -583,10 +605,10 @@ async function handlePhoto(file) {
     state.fps = 0;
     processResult(result);
     webgl.renderer.render(webgl.scene, webgl.camera);
-    if (state.hasFace) setStatus("Фото обработано локально", true);
+    if (state.hasFace) setStatus("Photo processed on this device", true);
   } catch (error) {
     console.error(error);
-    setStatus("Не удалось распознать фото");
+    setStatus("We could not detect a face in this photo");
     hideTracking();
   } finally {
     state.loading = false;
@@ -609,7 +631,7 @@ document.querySelectorAll(".model-card").forEach((button) => {
       item.classList.toggle("active", active);
       item.setAttribute("aria-checked", String(active));
     });
-    state.smoothed = null;
+    state.smoothed = { left: null, right: null };
     updateModelVisibility();
     syncFitControls();
     webgl.renderer.render(webgl.scene, webgl.camera);
@@ -619,7 +641,15 @@ document.querySelectorAll(".model-card").forEach((button) => {
 document.querySelectorAll(".swatch").forEach((button) => {
   button.addEventListener("click", () => {
     state.selectedColor = button.dataset.color;
-    caseMaterial.color.set(state.selectedColor);
+    Object.values(earScenes).forEach(({ root }) => {
+      root.traverse((child) => {
+        if (!child.isMesh) return;
+        const materials = Array.isArray(child.material) ? child.material : [child.material];
+        materials.forEach((material) => {
+          if (material.userData.role === "case") material.color.set(state.selectedColor);
+        });
+      });
+    });
     $("#colorName").textContent = button.dataset.name;
     document.querySelectorAll(".swatch").forEach((item) => {
       const active = item === button;
@@ -630,31 +660,35 @@ document.querySelectorAll(".swatch").forEach((button) => {
   });
 });
 
-document.querySelectorAll(".segmented button").forEach((button) => {
+document.querySelectorAll(".display-segmented button").forEach((button) => {
   button.addEventListener("click", () => {
-    state.selectedEar = button.dataset.ear;
-    state.lockedEar = button.dataset.ear === "auto" ? null : button.dataset.ear;
-    state.smoothed = null;
-    document.querySelectorAll(".segmented button").forEach((item) => item.classList.toggle("active", item === button));
+    state.displayMode = button.dataset.display;
+    state.smoothed = { left: null, right: null };
+    document.querySelectorAll(".display-segmented button").forEach((item) => item.classList.toggle("active", item === button));
+  });
+});
+
+document.querySelectorAll(".fit-side-tab").forEach((button) => {
+  button.addEventListener("click", () => {
+    state.activeFitEar = button.dataset.fitEar;
+    document.querySelectorAll(".fit-side-tab").forEach((item) => item.classList.toggle("active", item === button));
+    syncFitControls();
   });
 });
 
 calibrateButton.addEventListener("click", () => {
   if (!state.calibrating) {
     state.calibrating = true;
-    state.lockedEar = null;
-    state.selectedEar = "auto";
     state.diagnostics = true;
     debugButton.setAttribute("aria-pressed", "true");
     fitControls.hidden = false;
     calibrateButton.classList.add("active");
-    calibrateButton.textContent = "Поверните голову в профиль…";
-    setStatus("Медленно поверните голову в удобную сторону");
-    document.querySelectorAll(".segmented button").forEach((item) => item.classList.toggle("active", item.dataset.ear === "auto"));
+    calibrateButton.textContent = "Finish calibration";
+    setStatus(`Adjusting ${state.activeFitEar} ear`, true);
   } else {
     state.calibrating = false;
     calibrateButton.classList.remove("active");
-    calibrateButton.textContent = state.lockedEar ? "Перекалибровать посадку" : "Калибровать посадку";
+    calibrateButton.textContent = "Calibrate fit";
     saveFitAdjustments();
   }
 });
@@ -667,7 +701,7 @@ debugButton.addEventListener("click", () => {
 });
 
 function syncFitControls() {
-  const fit = state.fitAdjustments[state.selectedModel];
+  const fit = state.fitAdjustments[state.selectedModel][state.activeFitEar];
   fitInputs.x.value = String(Math.round(fit.x));
   fitInputs.y.value = String(Math.round(fit.y));
   fitInputs.scale.value = String(Math.round(fit.scale * 100));
@@ -680,17 +714,17 @@ function syncFitControls() {
 
 Object.entries(fitInputs).forEach(([key, input]) => {
   input.addEventListener("input", () => {
-    const fit = state.fitAdjustments[state.selectedModel];
+    const fit = state.fitAdjustments[state.selectedModel][state.activeFitEar];
     fit[key] = key === "scale" ? Number(input.value) / 100 : Number(input.value);
-    state.smoothed = null;
+    state.smoothed[state.activeFitEar] = null;
     saveFitAdjustments();
     syncFitControls();
   });
 });
 
 $("#resetFitButton").addEventListener("click", () => {
-  state.fitAdjustments[state.selectedModel] = { x: 0, y: 0, scale: 1, rotation: 0 };
-  state.smoothed = null;
+  state.fitAdjustments[state.selectedModel][state.activeFitEar] = { x: 0, y: 0, scale: 1, rotation: 0 };
+  state.smoothed[state.activeFitEar] = null;
   saveFitAdjustments();
   syncFitControls();
 });
